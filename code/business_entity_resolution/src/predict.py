@@ -44,7 +44,8 @@ def main(args):
     with open(args.model + ".meta.json") as f:
         meta = json.load(f)
 
-    feat["score"] = model.predict_proba(feat[ALL_FEATURE_COLUMNS])[:, 1]
+    feature_cols = meta.get("features", ALL_FEATURE_COLUMNS)
+    feat["score"] = model.predict_proba(feat[feature_cols])[:, 1]
 
     keep = feat[feat["score"] >= meta["threshold"]]
     if meta.get("margin_min", 0) > 0:
