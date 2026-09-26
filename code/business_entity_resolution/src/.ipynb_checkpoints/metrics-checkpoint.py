@@ -6,7 +6,6 @@ def predictions_from_scored_pairs(val_df, threshold, margin_min=0.0):
     preds = {}
     df = val_df[val_df["score"] >= threshold]
     if margin_min > 0.0:
-        # keep a candidate only if it beats the next-best candidate by margin_min
         df = df.sort_values(["source1_entity_id", "score"], ascending=[True, False])
         keep_rows = []
         for s1_id, group in df.groupby("source1_entity_id"):
@@ -24,7 +23,7 @@ def predictions_from_scored_pairs(val_df, threshold, margin_min=0.0):
             keep_rows.append(group.iloc[:max(cutoff, 1)])
         df = pd.concat(keep_rows) if keep_rows else df.iloc[0:0]
     for s1_id, group in df.groupby("source1_entity_id"):
-        preds[s1_id] = set(group["source2_or_3_entity_id"].tolist())
+        preds[s1_id] = set(group["candidate_entity_id"].tolist())
     return preds
 
 def f_beta(precision, recall, beta=0.5):

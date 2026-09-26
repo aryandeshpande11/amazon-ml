@@ -2,163 +2,164 @@
 Candidate generation (blocking) for Source 1 entities against the pooled
 Source 2 + Source 3 records.
 
-Two independent, cheap passes are unioned per S1 entity:
-  1. Token/PIN inverted-index pass  (_token_blocking_pass)
-  2. TF-IDF char n-gram top-k pass  (_tfidf_topk_pass)
+Fixes vs. the previous version, for scale (S1 ~1.7M, S2 ~4M, S3 ~5M rows):
 
-MAX_BLOCK_SIZE is the fix for a MemoryError seen at full scale: a generic
-token (e.g. "enterprises", "traders", "pvt") can appear in tens/hundreds of
-thousands of pool records. Unioning that block into every S1 entity that
-happens to contain the word blows up memory with no recall benefit -- a
-block that large carries essentially no discriminative signal anyway, and
-those pairs are still reachable through the TF-IDF pass. So any token or
-PIN whose posting list exceeds MAX_BLOCK_SIZE is skipped entirely rather
-than unioned in.
+1. The token index is now built from UNIQUE (country, norm_name) pairs,
+   not by exploding every one of the ~9M pool rows into tokens. Business
+   datasets at this scale have huge numbers of duplicate names across
+   branches/locations, so tokenizing every duplicate separately was most
+   of the wasted work.
+2. Every blocking pass (exact name, PIN+prefix, token) now drops any
+   group bigger than MAX_BLOCK_SIZE *before* the merge, not after --
+   a single generic name/word could otherwise blow the merge itself up
+   to millions of rows even though the final capped result is small.
+3. Candidates are capped per Source 1 entity (top_k) using a cheap
+   match-strength count, so memory downstream (features, scoring) is
+   bounded by a fixed multiple of len(source1), not by however many
+   pool records happened to share a token.
+4. A PoolIndex is built ONCE and reused across chunks of source1, so the
+   expensive pool-side grouping never runs more than once per program run.
+   generate_candidates() has the same signature as before -- it just
+   chunks internally now, so no notebook/script changes are required to
+   get the speedup.
 """
+import numpy as np
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.neighbors import NearestNeighbors
-from collections import defaultdict
 
-from preprocessing import normalize_name, normalize_address
-
-MAX_BLOCK_SIZE = 1000   # skip token/PIN blocks larger than this
-MIN_TOKEN_LEN = 4       # ignore very short tokens (too generic to be useful)
+MAX_BLOCK_SIZE = 2000
+MIN_TOKEN_LEN = 4
+DEFAULT_CHUNK_SIZE = 50_000
+DEFAULT_TOP_K = 40
 
 
 def _prep(df: pd.DataFrame, id_col: str, name_col: str, addr_col: str = "business_address") -> pd.DataFrame:
+    """Vectorized normalization -- no per-row python function calls."""
     out = df.copy()
-    out["_norm_name"] = out[name_col].apply(normalize_name)
-    addr = out[addr_col].apply(normalize_address) if addr_col in out.columns else None
-    out["_norm_addr"] = addr.apply(lambda d: d["norm"]) if addr is not None else ""
-    out["_pin"] = addr.apply(lambda d: d["pin"]) if addr is not None else ""
-    out["_blend"] = (out["_norm_name"] + " " + out["_norm_addr"]).str.strip()
+    temp_name = out[name_col].astype(str).str.lower().str.replace("&", " and ", regex=False)
+    out["_norm_name"] = temp_name.str.replace(r"[^\w\s]", " ", regex=True).str.strip().fillna("")
+    if addr_col in out.columns:
+        out["_pin"] = out[addr_col].astype(str).str.extract(r"\b(\d{5,6})\b", expand=False).fillna("")
+    else:
+        out["_pin"] = ""
+    if "country" in out.columns:
+        out["_country"] = out["country"].astype(str).str.strip().str.lower()
+    else:
+        out["_country"] = ""
+    out["_prefix"] = out["_norm_name"].str[:3]
     return out
 
 
-def _build_inverted_index(pool: pd.DataFrame, id_col: str):
+def _drop_oversized_groups(df: pd.DataFrame, group_cols: list) -> pd.DataFrame:
+    """Drop rows belonging to any group bigger than MAX_BLOCK_SIZE, so a
+    generic name/PIN/token can't blow up the merge that follows."""
+    counts = df.groupby(group_cols).size().reset_index(name="_cnt")
+    valid = counts[counts["_cnt"] <= MAX_BLOCK_SIZE][group_cols]
+    return df.merge(valid, on=group_cols)
+
+
+class PoolIndex:
     """
-    Builds token->{ids} and pin->{ids} indexes, DROPPING any block that
-    exceeds MAX_BLOCK_SIZE as soon as it's detected -- this bounds peak
-    memory instead of building the full oversized set and discarding it
-    afterwards.
+    Precomputed blocking structures for the pooled S2+S3 records.
+    Build ONCE per run (see generate_candidates) and reuse across every
+    source1 chunk -- rebuilding this per chunk is what made blocking slow.
     """
-    token_index = defaultdict(set)
-    pin_index = defaultdict(set)
-    oversized_tokens = set()
-    oversized_pins = set()
 
-    ids = pool[id_col].values
-    names = pool["_norm_name"].values
-    pins = pool["_pin"].values
+    def __init__(self, source2: pd.DataFrame, source3: pd.DataFrame,
+                 id_col: str = "entity_id", name_col: str = "business_name"):
+        pool = _prep(pd.concat([source2, source3], ignore_index=True), id_col, name_col)
+        self.pool_mini = pool[[id_col, "_country", "_norm_name", "_pin", "_prefix"]].rename(
+            columns={id_col: "candidate_entity_id"}
+        )
 
-    for eid, name, pin in zip(ids, names, pins):
-        for tok in set(name.split()):
-            if len(tok) < MIN_TOKEN_LEN or tok in oversized_tokens:
-                continue
-            bucket = token_index[tok]
-            bucket.add(eid)
-            if len(bucket) > MAX_BLOCK_SIZE:
-                oversized_tokens.add(tok)
-                del token_index[tok]   # free the memory immediately
-        if pin and pin not in oversized_pins:
-            bucket = pin_index[pin]
-            bucket.add(eid)
-            if len(bucket) > MAX_BLOCK_SIZE:
-                oversized_pins.add(pin)
-                del pin_index[pin]
+        # --- exact-name lookup (capped: drop names shared by > MAX_BLOCK_SIZE records)
+        pool_named = self.pool_mini[self.pool_mini["_norm_name"] != ""]
+        self.pool_exact = _drop_oversized_groups(pool_named, ["_country", "_norm_name"])
 
-    if oversized_tokens:
-        print(f"[blocking] skipped {len(oversized_tokens)} oversized name tokens (>{MAX_BLOCK_SIZE} postings)")
-    if oversized_pins:
-        print(f"[blocking] skipped {len(oversized_pins)} oversized PIN blocks (>{MAX_BLOCK_SIZE} postings)")
+        # --- PIN + name-prefix lookup, capped the same way
+        pool_pin = self.pool_mini[(self.pool_mini["_pin"] != "") & (self.pool_mini["_prefix"] != "")]
+        self.pool_pin = _drop_oversized_groups(pool_pin, ["_country", "_pin", "_prefix"])
 
-    return token_index, pin_index
+        # --- token index built from UNIQUE (country, norm_name) pairs only.
+        # Tokenize each distinct name once; keep a separate name -> ids map
+        # to expand matched names back to real candidate_entity_ids later.
+        unique_names = pool_named[["_country", "_norm_name"]].drop_duplicates().reset_index(drop=True)
+        unique_names["_uid"] = np.arange(len(unique_names))
 
+        tok = unique_names.assign(_tok=unique_names["_norm_name"].str.split()).explode("_tok")
+        tok = tok.dropna(subset=["_tok"])
+        tok = tok[tok["_tok"].str.len() >= MIN_TOKEN_LEN]
+        self.pool_tok = _drop_oversized_groups(tok, ["_country", "_tok"])[["_country", "_tok", "_uid"]]
 
-def _token_blocking_pass(source1: pd.DataFrame, pool: pd.DataFrame, id_col: str):
-    token_index, pin_index = _build_inverted_index(pool, id_col)
-
-    candidates = defaultdict(set)
-    ids = source1[id_col].values
-    names = source1["_norm_name"].values
-    pins = source1["_pin"].values
-
-    for eid, name, pin in zip(ids, names, pins):
-        cand = candidates[eid]
-        for tok in set(name.split()):
-            if len(tok) < MIN_TOKEN_LEN:
-                continue
-            bucket = token_index.get(tok)
-            if bucket:
-                cand |= bucket
-        if pin:
-            bucket = pin_index.get(pin)
-            if bucket:
-                cand |= bucket
-    return candidates
+        self.name_to_ids = pool_named.merge(
+            unique_names, on=["_country", "_norm_name"]
+        )[["_uid", "candidate_entity_id"]]
 
 
-def _tfidf_topk_pass(source1: pd.DataFrame, pool: pd.DataFrame, k: int, id_col: str):
-    vectorizer = TfidfVectorizer(
-        analyzer="char_wb", ngram_range=(2, 4), min_df=2, max_features=50_000
+def _cap_per_entity(matches: pd.DataFrame, top_k: int) -> pd.DataFrame:
+    """Keep at most top_k candidates per source1_entity_id, ranked by how
+    many independent blocking signals (exact/pin/token) agreed on that pair."""
+    if matches.empty:
+        return matches
+    strength = (
+        matches.groupby(["source1_entity_id", "candidate_entity_id"]).size()
+        .rename("match_strength").reset_index()
     )
-    pool_vecs = vectorizer.fit_transform(pool["_blend"])
-    s1_vecs = vectorizer.transform(source1["_blend"])
-
-    n_neighbors = min(k, len(pool))
-    nn = NearestNeighbors(n_neighbors=n_neighbors, metric="cosine", algorithm="brute")
-    nn.fit(pool_vecs)
-    distances, indices = nn.kneighbors(s1_vecs)
-
-    s1_ids = source1[id_col].values
-    pool_ids = pool[id_col].values
-
-    candidates = defaultdict(set)
-    for row_i in range(len(s1_ids)):
-        eid = s1_ids[row_i]
-        for dist, pool_idx in zip(distances[row_i], indices[row_i]):
-            if 1 - dist > 0:
-                candidates[eid].add(pool_ids[pool_idx])
-    return candidates
+    strength["_rank"] = strength.groupby("source1_entity_id")["match_strength"].rank(
+        ascending=False, method="first"
+    )
+    return strength[strength["_rank"] <= top_k][["source1_entity_id", "candidate_entity_id"]]
 
 
-def merge_candidate_passes(*passes) -> dict:
-    merged = defaultdict(set)
-    for pass_dict in passes:
-        for eid, cand_set in pass_dict.items():
-            merged[eid] |= cand_set
-    return merged
+def generate_candidates_for_chunk(s1_chunk: pd.DataFrame, pool_index: PoolIndex, top_k: int = DEFAULT_TOP_K,
+                                   id_col: str = "entity_id", name_col: str = "business_name",
+                                   verbose: bool = True) -> pd.DataFrame:
+    """Blocking for ONE chunk of source1 against a prebuilt PoolIndex."""
+    s1 = _prep(s1_chunk, id_col, name_col)
+    s1_mini = s1[[id_col, "_country", "_norm_name", "_pin", "_prefix"]].rename(columns={id_col: "source1_entity_id"})
+
+    s1_exact = s1_mini[s1_mini["_norm_name"] != ""]
+    match_1 = s1_exact.merge(pool_index.pool_exact, on=["_country", "_norm_name"])[
+        ["source1_entity_id", "candidate_entity_id"]]
+
+    s1_pin = s1_mini[(s1_mini["_pin"] != "") & (s1_mini["_prefix"] != "")]
+    match_2 = s1_pin.merge(pool_index.pool_pin, on=["_country", "_pin", "_prefix"])[
+        ["source1_entity_id", "candidate_entity_id"]]
+
+    s1_tok = s1_mini[["source1_entity_id", "_country", "_norm_name"]].assign(
+        _tok=s1_mini["_norm_name"].str.split()
+    ).explode("_tok")
+    s1_tok = s1_tok.dropna(subset=["_tok"])
+    s1_tok = s1_tok[s1_tok["_tok"].str.len() >= MIN_TOKEN_LEN]
+
+    tok_hits = s1_tok.merge(pool_index.pool_tok, on=["_country", "_tok"])[["source1_entity_id", "_uid"]]
+    match_3 = tok_hits.merge(pool_index.name_to_ids, on="_uid")[["source1_entity_id", "candidate_entity_id"]]
+
+    all_matches = pd.concat([match_1, match_2, match_3], ignore_index=True)
+    capped = _cap_per_entity(all_matches, top_k=top_k)
+
+    all_s1 = pd.DataFrame({"source1_entity_id": s1[id_col].unique()})
+    return all_s1.merge(capped, on="source1_entity_id", how="left")
 
 
-def generate_candidates(
-    source1: pd.DataFrame,
-    source2: pd.DataFrame,
-    source3: pd.DataFrame,
-    top_k: int = 30,
-    id_col: str = "entity_id",
-    name_col: str = "business_name",
-) -> pd.DataFrame:
+def iter_source1_chunks(source1: pd.DataFrame, chunk_size: int = DEFAULT_CHUNK_SIZE):
+    for start in range(0, len(source1), chunk_size):
+        yield source1.iloc[start:start + chunk_size]
+
+
+def generate_candidates(source1: pd.DataFrame, source2: pd.DataFrame, source3: pd.DataFrame,
+                         top_k: int = DEFAULT_TOP_K, id_col: str = "entity_id", name_col: str = "business_name",
+                         chunk_size: int = DEFAULT_CHUNK_SIZE, verbose: bool = True) -> pd.DataFrame:
     """
-    Returns a long-format DataFrame: source1_entity_id, candidate_entity_id.
-    S1 entities with zero candidates get one row with candidate_entity_id
-    = None so they survive downstream as declared singletons rather than
-    silently disappearing.
+    Same signature as before -- builds the PoolIndex once, then processes
+    source1 in chunks so peak memory only ever holds one chunk's worth of
+    candidate pairs. Existing notebook/script calls need no changes.
     """
-    s1 = _prep(source1, id_col, name_col)
-    pool = _prep(pd.concat([source2, source3], ignore_index=True), id_col, name_col)
-
-    token_cands = _token_blocking_pass(s1, pool, id_col=id_col)
-    tfidf_cands = _tfidf_topk_pass(s1, pool, k=top_k, id_col=id_col)
-    merged = merge_candidate_passes(token_cands, tfidf_cands)
-
-    rows = []
-    for eid in s1[id_col].values:
-        cand_set = merged.get(eid, set())
-        if cand_set:
-            for cand_id in cand_set:
-                rows.append((eid, cand_id))
-        else:
-            rows.append((eid, None))
-
-    return pd.DataFrame(rows, columns=["source1_entity_id", "candidate_entity_id"])
+    pool_index = PoolIndex(source2, source3, id_col=id_col, name_col=name_col)
+    n_chunks = (len(source1) + chunk_size - 1) // chunk_size
+    parts = []
+    for i, chunk in enumerate(iter_source1_chunks(source1, chunk_size)):
+        if verbose:
+            print(f"  blocking chunk {i + 1}/{n_chunks} ({len(chunk)} S1 rows)...")
+        parts.append(generate_candidates_for_chunk(chunk, pool_index, top_k=top_k, id_col=id_col, name_col=name_col,
+                                                     verbose=verbose))
+    return pd.concat(parts, ignore_index=True)

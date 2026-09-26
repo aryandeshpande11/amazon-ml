@@ -1,0 +1,28 @@
+{
+  "threshold": 0.7000000000000001,
+  "margin_min": 0.0,
+  "features": [
+    "name_exact",
+    "addr_exact",
+    "name_levenshtein",
+    "name_jaro_winkler",
+    "name_token_sort",
+    "name_token_set",
+    "name_jaccard",
+    "addr_levenshtein",
+    "addr_token_sort",
+    "addr_token_set",
+    "pin_match",
+    "pin_known_both",
+    "numeric_overlap_ratio",
+    "landmark_overlap",
+    "country_match",
+    "country_known_both",
+    "name_len_ratio",
+    "addr_len_ratio",
+    "source_is_s2",
+    "candidate_rank",
+    "n_competitors",
+    "score_margin"
+  ]
+}
